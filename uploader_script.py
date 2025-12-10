@@ -3,9 +3,7 @@ import sys
 import argparse
 import time
 import asyncio
-from telethon import TelegramClient
-# FIX: 'MessageMediaVideo' is no longer available in newer Telethon versions.
-# We now rely only on MessageMediaDocument, which typically encapsulates videos too.
+from telethon import TelegramClient, errors
 from telethon.tl.types import MessageMediaDocument
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -17,21 +15,54 @@ from google.oauth2.credentials import Credentials
 # YouTube Scopes required for video upload
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 
+# Use a distinct session name to avoid conflicts if needed
+SESSION_NAME = 'tg_session_output'
+
+# =================================================================
+# 🛑 FOR LOCAL SESSION GENERATION ONLY 🛑
+# These are only used if you run the script locally WITHOUT a link 
+# to generate the session string. They are IGNORED in the GitHub Action flow.
+LOCAL_TG_API_ID = 0
+LOCAL_TG_API_HASH = ""
+# =================================================================
+
+
 # --- TELEGRAM LINK UTILITY ---
 def parse_telegram_link(link):
-    """Parses a t.me/c/CHAT_ID/MSG_ID link into parts."""
+    """
+    Parses a t.me/c/CHAT_ID[/THREAD_ID]/MSG_ID link into parts, 
+    correctly handling the optional thread ID.
+    """
     try:
-        # Expected format: https://t.me/c/1234567890/12345
-        parts = link.strip('/').split('/')
-        if len(parts) < 2 or parts[-2] != 'c':
-            raise ValueError("Link must be a canonical message link, e.g., 'https://t.me/c/CHAT_ID/MSG_ID'")
-        
-        # Telegram client requires chat ID to be negative if it's a supergroup
-        channel_id = int(parts[-2] + parts[-3])
+        # Split the URL path by '/' and clean up all empty strings
+        # parts will contain: [..., 'c', 'CHAT_ID', 'MSG_ID'] or [..., 'c', 'CHAT_ID', 'THREAD_ID', 'MSG_ID']
+        parts = [p for p in link.strip('/').split('/') if p]
+
+        # Find the index of 'c' (should be the indicator for canonical supergroup link)
+        try:
+            # We look for 'c' to determine the start of the ID sequence
+            c_index = parts.index('c')
+        except ValueError:
+            raise ValueError("Link must contain '/c/' indicating a canonical channel link (e.g., https://t.me/c/ID/MSG).")
+
+        # The message ID is always the last element
         message_id = int(parts[-1])
+
+        # The base channel ID is always the part immediately after 'c'
+        # The thread ID (if present) is ignored for message retrieval by Telethon
+        if len(parts) <= c_index + 1:
+            raise ValueError("Link format is incomplete. Missing CHAT_ID.")
+            
+        base_channel_id = int(parts[c_index + 1])
+        
+        # Apply the Telethon fix for supergroup channel IDs found in canonical links (t.me/c/...)
+        # Supergroup IDs need to be formatted as -100xxxxxxxxxx
+        channel_id = int(f'-100{base_channel_id}')
+
         return channel_id, message_id
     except Exception as e:
-        print(f"Error parsing link: {e}")
+        # Catch and print the specific error, then exit
+        print(f"🔴 Error parsing link: {e}")
         sys.exit(1)
 
 # --- YOUTUBE AUTHENTICATION (FOR GITHUB WORKFLOW) ---
@@ -56,7 +87,7 @@ def get_youtube_service(client_id, client_secret, refresh_token):
         print("YouTube Authentication successful.")
         return youtube
     except Exception as e:
-        print(f"YouTube Authentication Error. Check CLIENT_ID, CLIENT_SECRET, and REFRESH_TOKEN: {e}")
+        print(f"🔴 YouTube Authentication Error. Check CLIENT_ID, CLIENT_SECRET, and REFRESH_TOKEN: {e}")
         sys.exit(1)
 
 # --- YOUTUBE UPLOAD ---
@@ -131,49 +162,49 @@ async def download_video_and_upload(link):
     YT_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
     YT_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
-    # MODIFIED: When running the main flow (with a link), we check for ALL necessary secrets.
-    # If any are missing, we exit immediately, preventing the interactive prompt.
+    # 2. Check for ALL necessary secrets.
     required_secrets = [TG_API_ID, TG_API_HASH, TG_SESSION_STRING, YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN]
     if not all(required_secrets):
         print("🔴 Missing one or more required secrets. Cannot proceed with upload.")
-        print("Please ensure TG_API_ID, TG_API_HASH, TG_SESSION_STRING, YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and YOUTUBE_REFRESH_TOKEN are all set as environment variables (GitHub Secrets).")
+        print("Please ensure all six required secrets are set in GitHub Actions.")
         sys.exit(1)
 
-    # 2. Parse the input link
+    # 3. Parse the input link
     channel_id, message_id = parse_telegram_link(link)
     print(f"Targeting channel ID: {channel_id}, Message ID: {message_id}")
     
     client = None
     downloaded_filepath = None
     try:
-        # 3. Connect to Telegram
+        # 4. Connect to Telegram
         print("Connecting to Telegram...")
         # Use the session string for non-interactive login
         client = TelegramClient(TG_SESSION_STRING, TG_API_ID, TG_API_HASH)
         await client.start()
         print("Connection successful.")
 
-        # 4. Get the message
+        # 5. Get the message
         print(f"Fetching message {message_id} from chat {channel_id}...")
         message = await client.get_messages(channel_id, ids=message_id)
 
-        # Updated check: MessageMediaVideo is removed, relying on MessageMediaDocument to cover videos.
+        # Updated check: relies on MessageMediaDocument to cover videos.
         if not message or not (message.media and isinstance(message.media, MessageMediaDocument)):
             print("🔴 Error: Message is missing or does not contain a supported media file (video/document).")
+            if message and message.media is None:
+                print("Note: Message exists but contains no media. Only videos/documents can be uploaded.")
             return
 
-        # 5. Download the file
+        # 6. Download the file
         file_name = f"video_{channel_id}_{message_id}.mp4"
         print(f"Downloading file to {file_name}...")
         downloaded_filepath = await client.download_media(message, file_name)
         print(f"✅ Download complete: {downloaded_filepath}")
         
         # Determine Title and Description
-        # Use the message text as the video description, and the file name as the title
         title = os.path.basename(downloaded_filepath)
         description = message.message if message.message else f"Exported video from Telegram message {link}"
         
-        # 6. YouTube Authentication and Upload
+        # 7. YouTube Authentication and Upload
         youtube_service = get_youtube_service(YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN)
         upload_video(youtube_service, downloaded_filepath, title, description)
 
@@ -181,7 +212,7 @@ async def download_video_and_upload(link):
         print(f"An unexpected error occurred during the process: {e}")
     
     finally:
-        # 7. Cleanup
+        # 8. Cleanup
         if client:
             await client.disconnect()
         if downloaded_filepath and os.path.exists(downloaded_filepath):
@@ -192,38 +223,54 @@ async def download_video_and_upload(link):
 async def generate_telegram_session(api_id, api_hash):
     """
     Runs locally to generate the TG_SESSION_STRING for use in GitHub secrets.
-    Requires TG_API_ID and TG_API_HASH to be set locally or passed in.
     """
     if not api_id or not api_hash:
         print("TG_API_ID and TG_API_HASH must be provided to generate a session string.")
         return
 
-    # Use a fixed session name 'temp_session'
-    client = TelegramClient('temp_session', api_id, api_hash)
+    # Use the specific session name defined globally
+    client = TelegramClient(SESSION_NAME, api_id, api_hash)
     
-    # NOTE: client.start() here is what prompts for phone number/token using input(),
-    # which requires an interactive terminal.
     print("\n--- ATTENTION ---")
-    print("You must run this command in a LOCAL, INTERACTIVE terminal (not in the CI/CD environment).")
+    print("You must run this command in a LOCAL, INTERACTIVE terminal (or clean cloud environment).")
     print("The script is about to prompt you for your phone number or bot token.")
     print("-----------------\n")
 
-    await client.start()
+    session_string = None
     
-    print("\n-------------------------------------------------------------")
-    print("      🔑 TELEGRAM SESSION STRING GENERATED 🔑")
-    print("-------------------------------------------------------------")
+    try:
+        # This is where the interactive prompts for phone, code, and 2FA password happen
+        await client.start()
+        session_string = client.session.save()
+        
+    except errors.SessionPasswordNeededError:
+        print("🔴 Login Failed: Two-factor authentication (2FA) is required. The script should have prompted you for a password.")
+        print("Please ensure you enter your password when prompted or disable 2FA for this generation step.")
+        return
+    except Exception as e:
+        print(f"🔴 Login Failed! Telethon Error: {e}")
+        print("Please check your phone number, login code (and password, if applicable) were entered correctly.")
+        return
+    finally:
+        await client.disconnect()
+        session_filepath = f'{SESSION_NAME}.session'
+        if os.path.exists(session_filepath):
+            try:
+                os.remove(session_filepath)
+                print(f"(Cleaned up local file: {session_filepath})")
+            except Exception:
+                print(f"⚠️ Warning: Could not delete session file '{session_filepath}'.")
+
+    if session_string:
+        print("\n-------------------------------------------------------------")
+        print("      🔑 TELEGRAM SESSION STRING GENERATED 🔑")
+        print("-------------------------------------------------------------")
+        print("\n✅ SUCCESS! COPY THIS ENTIRE STRING AND SAVE IT AS 'TG_SESSION_STRING' IN GITHUB SECRETS:")
+        print(session_string)
+        print("\n-------------------------------------------------------------")
+    else:
+        print("🔴 FINAL ERROR: Session string is missing after successful login.")
     
-    # Get the session string and print it clearly for the user to copy
-    session_string = client.session.save()
-    print("\nCOPY THIS ENTIRE STRING AND SAVE IT AS 'TG_SESSION_STRING' IN GITHUB SECRETS:")
-    print(session_string)
-    print("\n-------------------------------------------------------------")
-    
-    await client.disconnect()
-    # Cleanup local files that might be created by Telethon
-    if os.path.exists('temp_session.session'):
-        os.remove('temp_session.session')
 
 # --- MAIN EXECUTION ---
 if __name__ == '__main__':
@@ -235,18 +282,18 @@ if __name__ == '__main__':
     if not args.telegram_link:
         print("No Telegram link provided. Checking for secrets to initiate session generation...")
         
-        # Attempt to get local env variables for session generation
-        local_api_id = os.environ.get('TG_API_ID') or os.environ.get('TELEGRAM_API_ID') 
-        local_api_hash = os.environ.get('TG_API_HASH') or os.environ.get('TELEGRAM_API_HASH')
+        # Use hardcoded fallbacks only for local session generation if env vars are missing
+        local_api_id = os.environ.get('TG_API_ID') or str(LOCAL_TG_API_ID)
+        local_api_hash = os.environ.get('TG_API_HASH') or LOCAL_TG_API_HASH
 
-        if local_api_id and local_api_hash:
-             # Run session generation asynchronously
+        if local_api_id and local_api_hash and local_api_id != '0' and local_api_hash != '':
+            print("Found Telegram API credentials. Starting interactive login...")
             asyncio.run(generate_telegram_session(local_api_id, local_api_hash))
             print("Session generation finished. You must copy the string above and set it as a GitHub Secret.")
             print("\nNext, run the script again with the telegram link argument from GitHub Actions.")
         else:
-            print("To generate the session string locally, you must set the TG_API_ID and TG_API_HASH environment variables first.")
+            print("🔴 ERROR: To generate the session string locally, you must provide TG_API_ID and TG_API_HASH in the script variables or environment.")
         
     else:
-        # If the link is provided, run the full process asynchronously
+        # If the link is provided, run the full process asynchronously (Upload Mode)
         asyncio.run(download_video_and_upload(args.telegram_link))
