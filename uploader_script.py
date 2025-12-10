@@ -4,7 +4,6 @@ import argparse
 import time
 import asyncio
 from telethon import TelegramClient, errors
-# FIX: Import StringSession to enforce in-memory session storage for CI/CD environments
 from telethon.sessions import StringSession 
 from telethon.tl.types import MessageMediaDocument
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -127,6 +126,7 @@ def upload_video(youtube, filepath, title, description):
         try:
             status, response = request.next_chunk()
             if status:
+                # YouTube upload percentage report
                 print(f"Uploaded {int(status.progress() * 100)}%")
             
             if response is not None:
@@ -150,6 +150,13 @@ def upload_video(youtube, filepath, title, description):
             time.sleep(sleep_time)
             
     return None
+
+# --- DOWNLOAD PROGRESS REPORTER ---
+def download_progress_callback(current, total):
+    """Prints the Telegram download progress in MB and percentage."""
+    # Print the progress on the same line using \r
+    print(f"⏳ Telegram Download Progress: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
+
 
 # --- TELEGRAM DOWNLOAD ---
 async def download_video_and_upload(link):
@@ -181,8 +188,7 @@ async def download_video_and_upload(link):
         # 4. Connect to Telegram
         print("Connecting to Telegram...")
         
-        # FIX: Explicitly use StringSession to prevent Telethon from trying 
-        # to open/write a local .session file, which fails in restrictive CI/CD environments.
+        # Use StringSession to prevent local file system errors
         session = StringSession(TG_SESSION_STRING)
         client = TelegramClient(session, TG_API_ID, TG_API_HASH)
         
@@ -193,17 +199,27 @@ async def download_video_and_upload(link):
         print(f"Fetching message {message_id} from chat {channel_id}...")
         message = await client.get_messages(channel_id, ids=message_id)
 
-        # Updated check: relies on MessageMediaDocument to cover videos.
+        # Check for message existence and media type
         if not message or not (message.media and isinstance(message.media, MessageMediaDocument)):
             print("🔴 Error: Message is missing or does not contain a supported media file (video/document).")
+            # CRITICAL CHECK: If the message is retrieved but has no media, it might mean the session lacks access.
             if message and message.media is None:
-                print("Note: Message exists but contains no media. Only videos/documents can be uploaded.")
+                print("Note: The message was found, but it contains no media. Ensure the session has access to the video.")
             return
 
         # 6. Download the file
         file_name = f"video_{channel_id}_{message_id}.mp4"
-        print(f"Downloading file to {file_name}...")
-        downloaded_filepath = await client.download_media(message, file_name)
+        print(f"Starting download of media to {file_name}...")
+        
+        # Pass the progress callback to show live transfer status
+        downloaded_filepath = await client.download_media(
+            message, 
+            file_name, 
+            progress_callback=download_progress_callback
+        )
+        
+        # Print a clean line after the download is finished (overwriting the last progress update)
+        print("                                                                                            ", end='\r')
         print(f"✅ Download complete: {downloaded_filepath}")
         
         # Determine Title and Description
@@ -215,7 +231,7 @@ async def download_video_and_upload(link):
         upload_video(youtube_service, downloaded_filepath, title, description)
 
     except Exception as e:
-        print(f"An unexpected error occurred during the process: {e}")
+        print(f"\n🔴 An unexpected error occurred during the process: {e}")
     
     finally:
         # 8. Cleanup
