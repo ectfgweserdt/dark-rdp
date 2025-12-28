@@ -20,7 +20,8 @@ import googleapiclient.errors
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
-IMAGEN_MODEL = "imagen-4.0-generate-001"
+# Changed to the preview model that usually works on free tiers
+IMAGE_GEN_MODEL = "gemini-2.5-flash-image-preview"
 
 # Fetching the API Key
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
@@ -57,7 +58,8 @@ async def get_ai_metadata(filename):
     
     prompt = (
         f"You are a professional YouTube SEO manager. Analyze this file: '{filename}'\n"
-        "1. CLEAN TITLE: Search for the actual movie/series name and episode. Return ONLY the formal title (e.g., 'Love, Death & Robots - S04E09').\n"
+        "1. CLEAN TITLE: Return ONLY the formal title (e.g., 'Love, Death & Robots - S04E09'). "
+        "Remove ALL technical tags like WEB-DL, 720p, Dual Audio, etc.\n"
         "2. DESCRIPTION: Write 3 paragraphs of cinematic description. Use search tools for plot/cast. No links.\n"
         "3. IMAGE PROMPT: A descriptive artistic prompt for a cinematic poster (no text).\n"
         "Return ONLY JSON."
@@ -86,44 +88,43 @@ async def get_ai_metadata(filename):
 
 async def generate_thumbnail(image_prompt):
     if not GEMINI_API_KEY: return None
-    print(f"🎨 Generating AI Thumbnail for: {image_prompt[:40]}...")
+    print(f"🎨 Generating AI Thumbnail (Flash Image Mode)...")
     
-    # Try Imagen 4.0 first
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGEN_MODEL}:predict?key={GEMINI_API_KEY}"
+    # Using the Flash Image Preview which is generally accessible to free tier users
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGE_GEN_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    
     payload = {
-        "instances": [{"prompt": f"Cinematic movie poster, digital art, high detail, masterpiece, no text: {image_prompt}"}],
-        "parameters": {"sampleCount": 1}
+        "contents": [{
+            "parts": [{
+                "text": f"Generate a high-quality cinematic movie poster, digital art, high detail, masterpiece, NO TEXT: {image_prompt}"
+            }]
+        }],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"]
+        }
     }
     
     try:
-        res = requests.post(url, json=payload, timeout=60)
+        res = requests.post(url, json=payload, timeout=90)
         if res.status_code == 200:
             data = res.json()
-            img_b64 = data.get('predictions', [{}])[0].get('bytesBase64Encoded')
-            if img_b64:
-                with open("thumbnail.png", "wb") as f:
-                    f.write(base64.b64decode(img_b64))
-                print("✅ Thumbnail generated successfully.")
-                return "thumbnail.png"
-        else:
-            print(f"⚠️ Thumbnail API Error ({res.status_code}): {res.text[:100]}")
+            # Find the part that contains inlineData (the image)
+            parts = data.get('candidates', [{}])[0].get('content', {}).get('parts', [])
+            img_data = None
+            for p in parts:
+                if 'inlineData' in p:
+                    img_data = p['inlineData']['data']
+                    break
             
-            # FALLBACK: Try generating via Gemini-Image-Preview if Imagen fails
-            print("🔄 Attempting fallback image generation...")
-            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
-            fallback_payload = {
-                "contents": [{"parts": [{"text": f"Generate a cinematic movie poster for: {image_prompt}"}]}],
-                "generationConfig": {"responseModalities": ["IMAGE"]}
-            }
-            f_res = requests.post(fallback_url, json=fallback_payload, timeout=60)
-            if f_res.status_code == 200:
-                f_data = f_res.json()
-                f_b64 = f_data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[1].get('inlineData', {}).get('data')
-                if f_b64:
-                    with open("thumbnail.png", "wb") as f:
-                        f.write(base64.b64decode(f_b64))
-                    print("✅ Fallback thumbnail generated.")
-                    return "thumbnail.png"
+            if img_data:
+                with open("thumbnail.png", "wb") as f:
+                    f.write(base64.b64decode(img_data))
+                print("✅ Thumbnail generated successfully via Flash Image.")
+                return "thumbnail.png"
+            else:
+                print(f"⚠️ No image data found in response: {res.text[:200]}")
+        else:
+            print(f"⚠️ Image API Error ({res.status_code}): {res.text[:200]}")
                     
     except Exception as e:
         print(f"⚠️ Thumbnail generation failed: {e}")
@@ -177,8 +178,8 @@ def upload_to_youtube(video_path, metadata, thumb_path):
         
         if thumb_path and os.path.exists(thumb_path):
             print(f"🖼️ Applying thumbnail to video {video_id}...")
-            # Wait 10 seconds for YouTube to "recognize" the video exists
-            time.sleep(10)
+            # Wait for video to be indexed
+            time.sleep(12)
             try:
                 youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
                 print("✅ Thumbnail applied!")
@@ -209,18 +210,21 @@ async def run_flow(link):
     await client.download_media(message, raw_file, progress_callback=download_progress_callback)
     await client.disconnect()
 
-    # Step 1: Get Metadata
+    # Get Metadata first to get the image prompt
     metadata = await get_ai_metadata(message.file.name or raw_file)
     
-    # Step 2: Start Thumbnail generation and Video processing
+    # Run image generation and video processing
     thumb_task = generate_thumbnail(metadata.get('image_prompt', ''))
     final_video = process_video(raw_file)
     
     thumb = await thumb_task
     upload_to_youtube(final_video, metadata, thumb)
 
+    # Final cleanup
     for f in [raw_file, "processed_video.mp4", "thumbnail.png"]:
-        if os.path.exists(f): os.remove(f)
+        if os.path.exists(f): 
+            try: os.remove(f)
+            except: pass
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
